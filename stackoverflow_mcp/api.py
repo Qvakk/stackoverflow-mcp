@@ -84,8 +84,15 @@ class StackOverflowAPI:
 
         url = f"{self.BASE_URL}/{endpoint}"
         response = await self.client.get(url, params=params)
+        
+        # Handle 400 errors (often invalid tags)
+        if response.status_code == 400:
+            error_msg = f"Bad request to Stack Exchange API. "
+            if "tagged" in params or "nottagged" in params:
+                error_msg += "Check that all tags are valid Stack Overflow tags."
+            raise ValueError(error_msg)
+        
         response.raise_for_status()
-        return response.json()
         return response.json()
 
     async def search_questions(

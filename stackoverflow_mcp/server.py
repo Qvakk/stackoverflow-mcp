@@ -193,19 +193,57 @@ class StackOverflowMCPServer:
     async def _handle_search_by_query(
         self, args: dict[str, Any]
     ) -> list[TextContent]:
-        """Handle search_by_query tool."""
-        questions = await self.api.search_questions(
-            query=args["query"],
-            tags=args.get("tags"),
-            excluded_tags=args.get("excluded_tags"),
-            min_score=args.get("min_score", 0),
-            has_accepted_answer=args.get("has_accepted_answer", False),
-            title=args.get("title"),
-            body=args.get("body"),
-            min_answers=args.get("min_answers"),
-            sort_by=args.get("sort_by", "relevance"),
-            limit=args.get("limit", 10),
-        )
+        """Handle search_by_query tool with automatic tag fallback."""
+        tags = args.get("tags")
+        excluded_tags = args.get("excluded_tags")
+        invalid_tags: list[str] = []
+        
+        # Try with all tags first
+        try:
+            questions = await self.api.search_questions(
+                query=args["query"],
+                tags=tags,
+                excluded_tags=excluded_tags,
+                min_score=args.get("min_score", 0),
+                has_accepted_answer=args.get("has_accepted_answer", False),
+                title=args.get("title"),
+                body=args.get("body"),
+                min_answers=args.get("min_answers"),
+                sort_by=args.get("sort_by", "relevance"),
+                limit=args.get("limit", 10),
+            )
+        except ValueError as e:
+            # If tags caused the error, find and remove invalid tags
+            if "tags" in str(e).lower() and tags and len(tags) > 0:
+                # Try to find which tags are invalid by testing them one by one
+                valid_tags: list[str] = []
+                for tag in tags:
+                    try:
+                        await self.api.search_questions(
+                            query=args["query"],
+                            tags=[tag],
+                            min_score=0,
+                            limit=1,
+                        )
+                        valid_tags.append(tag)
+                    except ValueError:
+                        invalid_tags.append(tag)
+                
+                # Retry with only valid tags
+                questions = await self.api.search_questions(
+                    query=args["query"],
+                    tags=valid_tags if valid_tags else None,
+                    excluded_tags=excluded_tags,
+                    min_score=args.get("min_score", 0),
+                    has_accepted_answer=args.get("has_accepted_answer", False),
+                    title=args.get("title"),
+                    body=args.get("body"),
+                    min_answers=args.get("min_answers"),
+                    sort_by=args.get("sort_by", "relevance"),
+                    limit=args.get("limit", 10),
+                )
+            else:
+                raise
 
         response_format: Literal["json", "markdown"] = args.get(
             "response_format", "markdown"
@@ -229,6 +267,11 @@ class StackOverflowMCPServer:
                 text = self.formatter.format_questions_list_markdown(questions)
             else:
                 text = self.formatter.format_questions_list_json(questions)
+
+        # Prepend warning if invalid tags were found and removed
+        if invalid_tags:
+            warning = f"⚠️ **Note:** Invalid tags removed: `{'`, `'.join(invalid_tags)}`. Search performed with remaining valid tags.\n\n---\n\n"
+            text = warning + text
 
         return [TextContent(type="text", text=text)]
 
