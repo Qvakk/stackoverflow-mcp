@@ -1,0 +1,247 @@
+"""Stack Exchange API client module."""
+
+import asyncio
+import time
+from typing import Any, Optional
+from urllib.parse import urlencode
+
+import httpx
+
+from .config import config
+from .types import Answer, Comment, Question, SearchResult
+
+
+class RateLimiter:
+    """Rate limiter for API requests."""
+
+    def __init__(
+        self, max_requests: int, window_ms: int, retry_after_ms: int
+    ) -> None:
+        """Initialize rate limiter.
+
+        Args:
+            max_requests: Maximum requests allowed per window
+            window_ms: Time window in milliseconds
+            retry_after_ms: Delay after hitting rate limit
+        """
+        self.max_requests = max_requests
+        self.window_ms = window_ms
+        self.retry_after_ms = retry_after_ms
+        self.requests: list[float] = []
+
+    async def acquire(self) -> None:
+        """Acquire permission to make a request, waiting if necessary."""
+        now = time.time() * 1000  # Convert to milliseconds
+        # Remove old requests outside the window
+        self.requests = [
+            req for req in self.requests if now - req < self.window_ms
+        ]
+
+        if len(self.requests) >= self.max_requests:
+            # Wait until we can make another request
+            wait_time = self.retry_after_ms / 1000  # Convert to seconds
+            await asyncio.sleep(wait_time)
+            await self.acquire()  # Retry
+        else:
+            self.requests.append(now)
+
+
+class StackOverflowAPI:
+    """Client for Stack Exchange API."""
+
+    BASE_URL = "https://api.stackexchange.com/2.3"
+
+    def __init__(self) -> None:
+        """Initialize API client with rate limiting."""
+        self.rate_limiter = RateLimiter(
+            config.max_requests_per_window,
+            config.rate_limit_window_ms,
+            config.retry_after_ms,
+        )
+        self.client = httpx.AsyncClient(
+            timeout=30.0,
+            follow_redirects=True,
+            limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
+        )
+
+    async def _make_request(
+        self, endpoint: str, params: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Make a rate-limited API request.
+
+        Args:
+            endpoint: API endpoint path
+            params: Query parameters
+
+        Returns:
+            JSON response from API
+        """
+        await self.rate_limiter.acquire()
+
+        params["key"] = config.stack_exchange_api_key
+        params["site"] = "stackoverflow"
+        params["filter"] = "withbody"  # Include question/answer bodies
+
+        url = f"{self.BASE_URL}/{endpoint}"
+        response = await self.client.get(url, params=params)
+        response.raise_for_status()
+        return response.json()
+        return response.json()
+
+    async def search_questions(
+        self,
+        query: str,
+        tags: Optional[list[str]] = None,
+        excluded_tags: Optional[list[str]] = None,
+        min_score: int = 0,
+        has_accepted_answer: bool = False,
+        title: Optional[str] = None,
+        body: Optional[str] = None,
+        min_answers: Optional[int] = None,
+        sort_by: str = "relevance",
+        limit: int = 10,
+    ) -> list[Question]:
+        """Search for questions by query with advanced filters.
+
+        Args:
+            query: Search query string
+            tags: Tags to filter by
+            excluded_tags: Tags to exclude
+            min_score: Minimum score threshold
+            has_accepted_answer: Filter for questions with accepted answers
+            title: Text that must appear in the title
+            body: Text that must appear in the body
+            min_answers: Minimum number of answers
+            sort_by: Sort field (activity, creation, votes, relevance)
+            limit: Maximum number of results
+
+        Returns:
+            List of matching questions
+        """
+        valid_sorts = {"activity", "creation", "votes", "relevance"}
+        sort = sort_by if sort_by in valid_sorts else "relevance"
+        
+        params: dict[str, Any] = {
+            "q": query,
+            "sort": sort,
+            "order": "desc",
+            "pagesize": min(limit, 100),
+        }
+
+        if tags:
+            params["tagged"] = ";".join(tags)
+        if excluded_tags:
+            params["nottagged"] = ";".join(excluded_tags)
+        if min_score > 0:
+            params["min"] = min_score
+        if has_accepted_answer:
+            params["accepted"] = "True"
+        if title:
+            params["title"] = title
+        if body:
+            params["body"] = body
+        if min_answers is not None and min_answers > 0:
+            params["answers"] = min_answers
+
+        data = await self._make_request("search/advanced", params)
+        return [self._parse_question(item) for item in data.get("items", [])]
+
+    async def get_question(
+        self, question_id: int, include_comments: bool = False
+    ) -> SearchResult:
+        """Get a specific question with its answers.
+
+        Args:
+            question_id: Stack Overflow question ID
+            include_comments: Whether to include comments
+
+        Returns:
+            SearchResult with question, answers, and optionally comments
+        """
+        # Get question details
+        q_data = await self._make_request(
+            f"questions/{question_id}", {"filter": "withbody"}
+        )
+        question = self._parse_question(q_data["items"][0])
+
+        # Get answers
+        a_data = await self._make_request(
+            f"questions/{question_id}/answers",
+            {"filter": "withbody", "sort": "votes", "order": "desc"},
+        )
+        answers = [self._parse_answer(item) for item in a_data.get("items", [])]
+
+        # Get comments if requested
+        question_comments: tuple[Comment, ...] = ()
+        answer_comments: dict[int, tuple[Comment, ...]] = {}
+
+        if include_comments:
+            # Get question comments
+            qc_data = await self._make_request(
+                f"questions/{question_id}/comments", {}
+            )
+            question_comments = tuple(
+                self._parse_comment(item) for item in qc_data.get("items", [])
+            )
+
+            # Get answer comments
+            for answer in answers:
+                ac_data = await self._make_request(
+                    f"answers/{answer.answer_id}/comments", {}
+                )
+                answer_comments[answer.answer_id] = tuple(
+                    self._parse_comment(item) for item in ac_data.get("items", [])
+                )
+
+        return SearchResult(
+            question=question,
+            answers=tuple(answers),
+            question_comments=question_comments,
+            answer_comments=answer_comments,
+        )
+
+    def _parse_question(self, data: dict[str, Any]) -> Question:
+        """Parse question data from API response."""
+        return Question(
+            question_id=data["question_id"],
+            title=data["title"],
+            link=data["link"],
+            score=data["score"],
+            answer_count=data["answer_count"],
+            is_answered=data.get("is_answered", False),
+            view_count=data["view_count"],
+            tags=tuple(data["tags"]),
+            owner_display_name=data["owner"].get("display_name", "Unknown"),
+            creation_date=data["creation_date"],
+            last_activity_date=data["last_activity_date"],
+            body=data.get("body"),
+            accepted_answer_id=data.get("accepted_answer_id"),
+        )
+
+    def _parse_answer(self, data: dict[str, Any]) -> Answer:
+        """Parse answer data from API response."""
+        return Answer(
+            answer_id=data["answer_id"],
+            question_id=data["question_id"],
+            score=data["score"],
+            is_accepted=data.get("is_accepted", False),
+            owner_display_name=data["owner"].get("display_name", "Unknown"),
+            creation_date=data["creation_date"],
+            last_activity_date=data["last_activity_date"],
+            body=data.get("body", ""),
+        )
+
+    def _parse_comment(self, data: dict[str, Any]) -> Comment:
+        """Parse comment data from API response."""
+        return Comment(
+            comment_id=data["comment_id"],
+            post_id=data["post_id"],
+            score=data["score"],
+            owner_display_name=data["owner"].get("display_name", "Unknown"),
+            creation_date=data["creation_date"],
+            body=data["body"],
+        )
+
+    async def close(self) -> None:
+        """Close the HTTP client."""
+        await self.client.aclose()
