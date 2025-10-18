@@ -58,11 +58,24 @@ class StackOverflowAPI:
             config.rate_limit_window_ms,
             config.retry_after_ms,
         )
+        # Do not automatically follow redirects to prevent SSRF via redirect chains
         self.client = httpx.AsyncClient(
             timeout=30.0,
-            follow_redirects=True,
+            follow_redirects=False,
             limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
         )
+
+    def _validate_request_url(self, url: str) -> None:
+        # Basic validation: only allow requests under the configured BASE_URL
+        from urllib.parse import urlparse
+
+        parsed = urlparse(url)
+        base_parsed = urlparse(self.BASE_URL)
+        if parsed.scheme not in ("https",):
+            raise ValueError("Only HTTPS requests are allowed")
+        # Ensure hostname ends with StackExchange host
+        if not parsed.hostname or not parsed.hostname.endswith(base_parsed.hostname):
+            raise ValueError("Request to unexpected host blocked")
 
     async def _make_request(
         self, endpoint: str, params: dict[str, Any]
@@ -83,7 +96,13 @@ class StackOverflowAPI:
         params["filter"] = "withbody"  # Include question/answer bodies
 
         url = f"{self.BASE_URL}/{endpoint}"
+        # Validate that the URL stays under allowed BASE_URL
+        self._validate_request_url(url)
+
         response = await self.client.get(url, params=params)
+        # If a redirect is returned, block it (prevent SSRF via redirect)
+        if 300 <= response.status_code < 400:
+            raise ValueError("Unexpected redirect from Stack Exchange API blocked for security reasons")
         
         # Handle 400 errors (often invalid tags)
         if response.status_code == 400:

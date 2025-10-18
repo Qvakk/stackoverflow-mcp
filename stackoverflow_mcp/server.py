@@ -10,6 +10,9 @@ from mcp.types import Tool, TextContent
 from .api import StackOverflowAPI
 from .config import config
 from .formatter import Formatter
+from .utilities import input_validation as iv
+from .utilities import output_filtering as of
+from .utilities import logging as slog
 
 
 class StackOverflowMCPServer:
@@ -194,15 +197,22 @@ class StackOverflowMCPServer:
         self, args: dict[str, Any]
     ) -> list[TextContent]:
         """Handle search_by_query tool with automatic tag fallback."""
-        tags = args.get("tags")
-        excluded_tags = args.get("excluded_tags")
+        # Validate and sanitize inputs
+        try:
+            query = iv.validate_query(args["query"])
+        except iv.ValidationError:
+            slog.log_event("input_validation_failed", slog.Severity.HIGH, "Invalid search query", {"query": str(args.get("query"))})
+            raise
+
+        tags = iv.validate_tags(args.get("tags"))
+        excluded_tags = iv.validate_tags(args.get("excluded_tags"))
         invalid_tags: list[str] = []
         no_results_fallback = False
         
         # Try with all tags first
         try:
             questions = await self.api.search_questions(
-                query=args["query"],
+                query=query,
                 tags=tags,
                 excluded_tags=excluded_tags,
                 min_score=args.get("min_score", 0),
@@ -211,7 +221,7 @@ class StackOverflowMCPServer:
                 body=args.get("body"),
                 min_answers=args.get("min_answers"),
                 sort_by=args.get("sort_by", "relevance"),
-                limit=args.get("limit", 10),
+                limit=iv.validate_limit(args.get("limit", 10)),
             )
         except ValueError as e:
             # If tags caused the error, find and remove invalid tags
@@ -221,7 +231,7 @@ class StackOverflowMCPServer:
                 for tag in tags:
                     try:
                         await self.api.search_questions(
-                            query=args["query"],
+                            query=query,
                             tags=[tag],
                             min_score=0,
                             limit=1,
@@ -232,7 +242,7 @@ class StackOverflowMCPServer:
                 
                 # Retry with only valid tags
                 questions = await self.api.search_questions(
-                    query=args["query"],
+                    query=query,
                     tags=valid_tags if valid_tags else None,
                     excluded_tags=excluded_tags,
                     min_score=args.get("min_score", 0),
@@ -241,7 +251,7 @@ class StackOverflowMCPServer:
                     body=args.get("body"),
                     min_answers=args.get("min_answers"),
                     sort_by=args.get("sort_by", "relevance"),
-                    limit=args.get("limit", 10),
+                    limit=iv.validate_limit(args.get("limit", 10)),
                 )
             else:
                 raise
@@ -250,7 +260,7 @@ class StackOverflowMCPServer:
         if not questions and tags:
             no_results_fallback = True
             questions = await self.api.search_questions(
-                query=args["query"],
+                query=query,
                 tags=None,
                 excluded_tags=None,
                 min_score=args.get("min_score", 0),
@@ -259,7 +269,7 @@ class StackOverflowMCPServer:
                 body=args.get("body"),
                 min_answers=args.get("min_answers"),
                 sort_by=args.get("sort_by", "relevance"),
-                limit=args.get("limit", 10),
+                limit=iv.validate_limit(args.get("limit", 10)),
             )
 
         response_format: Literal["json", "markdown"] = args.get(
@@ -293,13 +303,24 @@ class StackOverflowMCPServer:
             warning = "ℹ️ **Note:** No results found with the specified tags. Showing results without tag filtering.\n\n---\n\n"
             text = warning + text
 
-        return [TextContent(type="text", text=text)]
+        # Sanitize output for PII and injection tokens
+        sanitized, pii_count, inj_count = of.sanitize_output(text)
+        if pii_count:
+            slog.log_event("pii_detected", slog.Severity.HIGH, "PII redacted in search_by_query output", {"redactions": pii_count})
+        if inj_count:
+            slog.log_event("output_injection", slog.Severity.CRITICAL, "Output contained injection tokens and was sanitized", {"count": inj_count})
+
+        return [TextContent(type="text", text=sanitized)]
 
     async def _handle_search_by_error(
         self, args: dict[str, Any]
     ) -> list[TextContent]:
         """Handle search_by_error tool."""
-        error_message: str = args["error_message"]
+        try:
+            error_message = iv.validate_error_message(args["error_message"])
+        except iv.ValidationError:
+            slog.log_event("input_validation_failed", slog.Severity.HIGH, "Invalid error_message", {"error_message": str(args.get("error_message"))})
+            raise
 
         # Extract key error pattern from message
         query = self._extract_error_query(error_message)
@@ -316,7 +337,7 @@ class StackOverflowMCPServer:
             tags=tags if tags else None,
             min_score=args.get("min_score", 1),
             has_accepted_answer=True,  # Prefer questions with solutions
-            limit=args.get("limit", 5),
+            limit=iv.validate_limit(args.get("limit", 5)),
         )
 
         response_format: Literal["json", "markdown"] = args.get(
@@ -339,14 +360,27 @@ class StackOverflowMCPServer:
         else:
             text = "No solutions found for this error."
 
-        return [TextContent(type="text", text=text)]
+        # Sanitize output
+        sanitized, pii_count, inj_count = of.sanitize_output(text)
+        if pii_count:
+            slog.log_event("pii_detected", slog.Severity.HIGH, "PII redacted in search_by_error output", {"redactions": pii_count})
+        if inj_count:
+            slog.log_event("output_injection", slog.Severity.CRITICAL, "Output contained injection tokens and was sanitized", {"count": inj_count})
+
+        return [TextContent(type="text", text=sanitized)]
 
     async def _handle_get_question(
         self, args: dict[str, Any]
     ) -> list[TextContent]:
         """Handle get_question tool."""
+        try:
+            qid = iv.validate_question_id(args["question_id"])
+        except iv.ValidationError:
+            slog.log_event("input_validation_failed", slog.Severity.HIGH, "Invalid question_id", {"question_id": str(args.get("question_id"))})
+            raise
+
         result = await self.api.get_question(
-            question_id=args["question_id"],
+            question_id=qid,
             include_comments=args.get("include_comments", False),
         )
 
@@ -359,7 +393,14 @@ class StackOverflowMCPServer:
         else:
             text = self.formatter.format_json(result)
 
-        return [TextContent(type="text", text=text)]
+        # Sanitize output
+        sanitized, pii_count, inj_count = of.sanitize_output(text)
+        if pii_count:
+            slog.log_event("pii_detected", slog.Severity.HIGH, "PII redacted in get_question output", {"redactions": pii_count})
+        if inj_count:
+            slog.log_event("output_injection", slog.Severity.CRITICAL, "Output contained injection tokens and was sanitized", {"count": inj_count})
+
+        return [TextContent(type="text", text=sanitized)]
 
     @staticmethod
     def _extract_error_query(error_message: str) -> str:
