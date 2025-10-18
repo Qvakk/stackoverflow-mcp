@@ -88,6 +88,9 @@ class StackOverflowAPI:
 
         Returns:
             JSON response from API
+            
+        Raises:
+            ValueError: For all errors without exposing API key or URL
         """
         await self.rate_limiter.acquire()
 
@@ -99,20 +102,59 @@ class StackOverflowAPI:
         # Validate that the URL stays under allowed BASE_URL
         self._validate_request_url(url)
 
-        response = await self.client.get(url, params=params)
+        try:
+            response = await self.client.get(url, params=params)
+        except httpx.TimeoutException:
+            raise ValueError("Stack Exchange API request timed out. Please try again.")
+        except httpx.NetworkError:
+            raise ValueError("Network error connecting to Stack Exchange API. Please check your connection.")
+        except httpx.HTTPError as e:
+            # Catch any other httpx errors without exposing details
+            raise ValueError(f"Error communicating with Stack Exchange API: {type(e).__name__}")
+        
         # If a redirect is returned, block it (prevent SSRF via redirect)
         if 300 <= response.status_code < 400:
             raise ValueError("Unexpected redirect from Stack Exchange API blocked for security reasons")
         
-        # Handle 400 errors (often invalid tags)
+        # Handle errors without exposing API key in error messages
         if response.status_code == 400:
-            error_msg = f"Bad request to Stack Exchange API. "
-            if "tagged" in params or "nottagged" in params:
-                error_msg += "Check that all tags are valid Stack Overflow tags."
+            # Parse the API's error response to get the actual error message
+            try:
+                error_data = response.json()
+                api_error_msg = error_data.get("error_message", "Unknown error")
+                error_msg = f"Bad request to Stack Exchange API: {api_error_msg}"
+            except Exception:
+                # If we can't parse the error response, use a generic message
+                error_msg = "Bad request to Stack Exchange API. "
+                if "tagged" in params or "nottagged" in params:
+                    error_msg += "Check that all tags are valid Stack Overflow tags."
             raise ValueError(error_msg)
         
-        response.raise_for_status()
-        return response.json()
+        if response.status_code == 429:
+            # Try to get backoff time from API response
+            try:
+                error_data = response.json()
+                backoff = error_data.get("backoff", 0)
+                if backoff > 0:
+                    raise ValueError(f"Stack Exchange API rate limit exceeded. Please wait {backoff} seconds and try again.")
+            except Exception:
+                pass
+            raise ValueError("Stack Exchange API rate limit exceeded. Please wait a moment and try again.")
+        
+        if not response.is_success:
+            # Try to get error message from API, fallback to generic message
+            try:
+                error_data = response.json()
+                api_error_msg = error_data.get("error_message", "Unknown error")
+                raise ValueError(f"Stack Exchange API error ({response.status_code}): {api_error_msg}")
+            except Exception:
+                # Fallback to generic error without exposing URL/key
+                raise ValueError(f"Stack Exchange API error: {response.status_code} {response.reason_phrase}")
+        
+        try:
+            return response.json()
+        except Exception:
+            raise ValueError("Failed to parse Stack Exchange API response.")
 
     async def search_questions(
         self,
@@ -146,6 +188,11 @@ class StackOverflowAPI:
         """
         valid_sorts = {"activity", "creation", "votes", "relevance"}
         sort = sort_by if sort_by in valid_sorts else "relevance"
+        
+        # If min_score is specified and sort is "relevance", change to "votes"
+        # because "relevance" sort doesn't accept min/max parameters
+        if min_score > 0 and sort == "relevance":
+            sort = "votes"
         
         params: dict[str, Any] = {
             "q": query,
@@ -188,6 +235,11 @@ class StackOverflowAPI:
         q_data = await self._make_request(
             f"questions/{question_id}", {"filter": "withbody"}
         )
+        
+        # Check if question exists
+        if not q_data.get("items"):
+            raise ValueError(f"Question with ID {question_id} not found or is not accessible.")
+        
         question = self._parse_question(q_data["items"][0])
 
         # Get answers
