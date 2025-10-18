@@ -32,6 +32,7 @@ Base URL is `https://api.stackexchange.com/2.3`
 The search_by_query tool supports a bunch of filters: `title`, `body`, `answers` (minimum), `tagged`/`nottagged`, `min` score, `accepted` answer, and `sort` by relevance/votes/creation/activity.
 Max 100 results per request.
 **Important:** If invalid tags cause a 400 error, the server automatically identifies which tags are invalid by testing them one-by-one, removes only the invalid ones, and retries with the remaining valid tags. It then shows a warning listing the specific invalid tags. This is in `_handle_search_by_query()` with a try/except block.
+**Also:** If the search with tags returns no results, it automatically retries without tags and shows an info message. This ensures users get helpful results even when tags are too restrictive.
 
 ## Common mistakes
 

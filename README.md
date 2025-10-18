@@ -144,6 +144,7 @@ Advanced search with comprehensive filtering options.
 - `query` (required): Search query string
 - `tags`: Filter by tags (e.g., `["python", "pandas"]`)
   - ⚠️ **Note**: Invalid tags are automatically detected and removed. The search continues with only valid tags and displays which tags were removed.
+  - ℹ️ **Note**: If no results are found with tags, the search automatically retries without tag filtering to find relevant content.
 - `excluded_tags`: Exclude specific tags
 - `min_score`: Minimum score threshold (default: 0)
 - `has_accepted_answer`: Require accepted answer (default: false)

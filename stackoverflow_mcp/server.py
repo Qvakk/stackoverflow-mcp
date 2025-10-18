@@ -197,6 +197,7 @@ class StackOverflowMCPServer:
         tags = args.get("tags")
         excluded_tags = args.get("excluded_tags")
         invalid_tags: list[str] = []
+        no_results_fallback = False
         
         # Try with all tags first
         try:
@@ -244,6 +245,22 @@ class StackOverflowMCPServer:
                 )
             else:
                 raise
+        
+        # If no results and tags were used, try again without tags
+        if not questions and tags:
+            no_results_fallback = True
+            questions = await self.api.search_questions(
+                query=args["query"],
+                tags=None,
+                excluded_tags=None,
+                min_score=args.get("min_score", 0),
+                has_accepted_answer=args.get("has_accepted_answer", False),
+                title=args.get("title"),
+                body=args.get("body"),
+                min_answers=args.get("min_answers"),
+                sort_by=args.get("sort_by", "relevance"),
+                limit=args.get("limit", 10),
+            )
 
         response_format: Literal["json", "markdown"] = args.get(
             "response_format", "markdown"
@@ -271,6 +288,9 @@ class StackOverflowMCPServer:
         # Prepend warning if invalid tags were found and removed
         if invalid_tags:
             warning = f"⚠️ **Note:** Invalid tags removed: `{'`, `'.join(invalid_tags)}`. Search performed with remaining valid tags.\n\n---\n\n"
+            text = warning + text
+        elif no_results_fallback:
+            warning = "ℹ️ **Note:** No results found with the specified tags. Showing results without tag filtering.\n\n---\n\n"
             text = warning + text
 
         return [TextContent(type="text", text=text)]
