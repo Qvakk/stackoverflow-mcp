@@ -14,3 +14,5 @@ A production-ready Python 3.12 MCP server for searching Stack Overflow with comp
 **Search Filters:** Tags, score, answers, accepted, title, body, sort order
 **Rate Limiting:** 30 requests/minute (configurable)
 **Input Limits:** Query (2000 chars), tags (10×50 chars), results (max 100)
+
+Use https://modelcontextprotocol-security.io/top10/server/ for vulnerability guidelines.
